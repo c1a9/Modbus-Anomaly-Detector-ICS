@@ -1,19 +1,58 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <syslog.h>
+#include <arpa/inet.h>
 #include "../include/modbus_def.h"
 
-// 组员D实现：根据AI结果执行防护动作（阻断/限流/告警/日志）
-// 依赖：iptables（网络阻断）、syslog（系统日志）
-void execute_protect(AIResult* res) {
-    if (res->is_anomaly) {
-        // TODO 1. 告警：打印控制台+写入系统日志（syslog）
-        printf("[ANOMALY DETECTED] Score:%.2f, Reason:%s\n", res->score, res->reason);
-        // TODO 2. 网络阻断：调用iptables命令，屏蔽异常IP（如system("iptables -A INPUT -s 192.168.1.100 -j DROP")）
-        // TODO 3. 限流：限制异常IP的访问频率（如iptables限速）
-        // TODO 4. 上报：将异常信息上报到态势感知平台（可选）
+static char blocked_ips[100][IP_STR_LEN];
+static int blocked_count = 0;
+
+static int is_ip_blocked(const char *ip) {
+    for (int i = 0; i < blocked_count; i++)
+        if (strcmp(blocked_ips[i], ip) == 0) return 1;
+    return 0;
+}
+
+static void add_blocked_ip(const char *ip) {
+    if (blocked_count < 100 && !is_ip_blocked(ip)) {
+        strncpy(blocked_ips[blocked_count], ip, IP_STR_LEN);
+        blocked_count++;
     }
-    else {
-        // 正常：打印日志（可选）
-        // printf("[NORMAL] Reason:%s\n", res->reason);
+}
+
+static void iptables_command(const char *cmd) {
+    if (system(cmd) != 0) {
+        syslog(LOG_WARNING, "iptables command failed: %s", cmd);
     }
+}
+
+void execute_protect(AIResult *res, ModbusPacket *pkt) {
+    if (!res->is_anomaly) return;
+		
+    if (strcmp((char*)pkt->src_ip, "127.0.0.1") == 0) {
+        printf("[INFO] Skip blocking localhost\n");
+        return;
+    }
+
+    printf("\033[31m[ALERT] Anomaly detected! Source IP: %s, reason: %s\033[0m\n", pkt->src_ip, res->reason);
+    syslog(LOG_ALERT, "Modbus anomaly: IP=%s, score=%.2f, reason=%s", pkt->src_ip, res->score, res->reason);
+
+    if (!is_ip_blocked((char*)pkt->src_ip)) {
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "iptables -A INPUT -s %s -j DROP", pkt->src_ip);
+        iptables_command(cmd);
+        snprintf(cmd, sizeof(cmd), "iptables -A OUTPUT -d %s -j DROP", pkt->src_ip);
+        iptables_command(cmd);
+        add_blocked_ip((char*)pkt->src_ip);
+        printf("[PROTECT] Blocked IP: %s\n", pkt->src_ip);
+        syslog(LOG_NOTICE, "Blocked IP: %s", pkt->src_ip);
+    }
+
+    char limit_cmd[256];
+    snprintf(limit_cmd, sizeof(limit_cmd), "iptables -A INPUT -s %s -m limit --limit 10/second -j ACCEPT", pkt->src_ip);
+    iptables_command(limit_cmd);
+    snprintf(limit_cmd, sizeof(limit_cmd), "iptables -A INPUT -s %s -j DROP", pkt->src_ip);
+    iptables_command(limit_cmd);
+    printf("[PROTECT] Rate limited IP: %s (10 packets/sec)\n", pkt->src_ip);
 }

@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Modbus ICS Anomaly Detection</title>
+<style>body{font-family:monospace;background:#1e1e2e;color:#cdd6f4;padding:20px;}table{border-collapse:collapse;width:100%;}th,td{border:1px solid #45475a;padding:8px;text-align:left;}th{background:#313244;}.anomaly{background:#f38ba8;color:#1e1e2e;}</style>
+<script>setInterval(function(){fetch('status.json').then(r=>r.json()).then(data=>{
+document.getElementById('src_ip').innerText=data.src_ip;
+document.getElementById('func').innerText=data.func_code;
+document.getElementById('anomaly').innerText=data.is_anomaly?'Anomaly':'Normal';
+document.getElementById('score').innerText=data.score;
+document.getElementById('reason').innerText=data.reason;
+document.getElementById('interval').innerText=data.interval_ms;
+document.getElementById('rw_ratio').innerText=data.read_write_ratio;
+document.getElementById('value_change').innerText=data.value_change;
+let row=document.getElementById('last_row');row.className=data.is_anomaly?'anomaly':'';
+}).catch(e=>console.error);},500);</script>
+</head><body><h2>Modbus ICS Anomaly Detection Dashboard</h2>
+<table><tr><th>Source IP</th><th>Func Code</th><th>Status</th><th>Score</th><th>Reason</th></tr>
+<tr id='last_row'><td id='src_ip'>-</td><td id='func'>-</td><td id='anomaly'>-</td><td id='score'>-</td><td id='reason'>-</td></tr>
+<tr><th>Interval(ms)</th><th>R/W Ratio</th><th>Value Change</th><td colspan='2'></td></tr>
+<tr><td id='interval'>-</td><td id='rw_ratio'>-</td><td id='value_change'>-</td><td colspan='2'></td></tr>
+</table><p>Auto-refresh 0.5s | iptables -L INPUT to see blocking rules</p></body></html>

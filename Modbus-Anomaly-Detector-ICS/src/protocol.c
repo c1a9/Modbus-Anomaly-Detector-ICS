@@ -1,49 +1,64 @@
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <math.h>
 #include "../include/modbus_def.h"
 
-// 全局变量：保存上一个包的信息（用于计算间隔/变化幅度）
-static ModbusPacket last_pkt = { 0 };
-static u32 read_count = 0;  // 读指令计数
-static u32 write_count = 0; // 写指令计数
+static ModbusPacket last_pkt = {0};
+static u32 read_count = 0, write_count = 0;
+static i32 intervals[100] = {0};
+static int interval_index = 0, interval_count = 0;
 
-// 组员B实现：解析Modbus包，提取特征填充Feature
-void parse_modbus(ModbusPacket* pkt, Feature* feat) {
-    // TODO 1. 功能码判断：统计读写次数，计算读写比例
-    if (pkt->func_code == MODBUS_FUNC_READ) {
-        read_count++;
-    }
-    else if (pkt->func_code == MODBUS_FUNC_WRITE) {
-        write_count++;
-    }
+void parse_modbus(ModbusPacket *pkt, Feature *feat) {
+    // read/write ratio
+    if (pkt->func_code == MODBUS_FUNC_READ) read_count++;
+    else if (pkt->func_code == MODBUS_FUNC_WRITE) write_count++;
     feat->read_write_ratio = (write_count == 0) ? (float)read_count : (float)read_count / write_count;
 
-    // TODO 2. 计算指令间隔：当前时间戳 - 上一个包的时间戳
+    // interval
     if (last_pkt.timestamp != 0) {
         feat->interval_ms = pkt->timestamp - last_pkt.timestamp;
-    }
-    else {
-        feat->interval_ms = 0; // 第一个包，间隔为0
+        if (feat->interval_ms < 0) feat->interval_ms = 0;
+    } else {
+        feat->interval_ms = 0;
     }
 
-    // TODO 3. 计算寄存器值变化幅度：|当前值-上一值|
+    // value change
     feat->value_change = abs((int)pkt->reg_value - (int)last_pkt.reg_value);
 
-    // TODO 4. 滑动窗口统计：统计窗口内数据包数量（如窗口大小100个）
-    feat->window_pkt_num++;
-    if (feat->window_pkt_num > 100) {
-        feat->window_pkt_num = 1;
+    // sliding window
+    static u16 window_counter = 0;
+    window_counter = (window_counter % 100) + 1;
+    feat->window_pkt_num = window_counter;
+
+    if (feat->interval_ms > 0) {
+        intervals[interval_index] = feat->interval_ms;
+        interval_index = (interval_index + 1) % 100;
+        if (interval_count < 100) interval_count++;
     }
 
-    // TODO 5. 初步计算异常分数（基础版，可由AI模块再优化）
+    // avg and std of intervals
+    if (interval_count >= 2) {
+        double sum = 0;
+        for (int i = 0; i < interval_count; i++) sum += intervals[i];
+        feat->avg_interval = (float)(sum / interval_count);
+        double var = 0;
+        for (int i = 0; i < interval_count; i++) {
+            double diff = intervals[i] - feat->avg_interval;
+            var += diff * diff;
+        }
+        feat->std_interval = (float)sqrt(var / interval_count);
+    } else {
+        feat->avg_interval = 0;
+        feat->std_interval = 0;
+    }
+
+    // simple anomaly score
     feat->anomaly_score = 0.0f;
-    if (feat->interval_ms < 10) { // 指令间隔过短，初步判定异常
-        feat->anomaly_score += 0.5f;
-    }
-    if (feat->value_change > 100) { // 数值突变，初步判定异常
-        feat->anomaly_score += 0.5f;
-    }
+    if (feat->interval_ms > 0 && feat->interval_ms < 10) feat->anomaly_score += 0.4f;
+    if (feat->value_change > 1000) feat->anomaly_score += 0.4f;
+    if (feat->read_write_ratio > 20.0f) feat->anomaly_score += 0.3f;
+    if (feat->anomaly_score > 1.0f) feat->anomaly_score = 1.0f;
 
-    // 更新上一个包的信息
     last_pkt = *pkt;
 }
