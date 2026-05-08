@@ -1,84 +1,113 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <sys/select.h>
-#include <termios.h>
-#include "../include/modbus_def.h"
+#include <signal.h>
+#include <string.h>
+#include <pthread.h>
+#include <getopt.h>
+#include "modbus_def.h"
+#include "capture.h"
+#include "session_manager.h"
+#include "detector.h"
+#include "response.h"
+#include "logger.h"
+#include "config.h"
+#include "web.h"
 
-void capture_packet(ModbusPacket *pkt);
-void parse_modbus(ModbusPacket *pkt, Feature *feat);
-void ai_detect(Feature *feat, AIResult *res);
-void execute_protect(AIResult *res, ModbusPacket *pkt);
-void init_log(void);
-void close_log(void);
-void web_update_status(ModbusPacket *pkt, Feature *feat, AIResult *res);
-void start_http_server(void);
-void stop_http_server(void);
-void init_web(void);
+static volatile int running = 1;
 
-static volatile int keep_running = 1;
+void signal_handler(int sig) {
+    if (sig == SIGINT || sig == SIGTERM) running = 0;
+}
 
-// 检查是否有键盘输入（非阻塞），返回输入的字符，如果没有输入则返回 0
-static char check_keypress(void) {
-    struct timeval tv = {0, 0};
-    fd_set fds;
-    FD_ZERO(&fds);
-    FD_SET(STDIN_FILENO, &fds);
-    if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0) {
-        char ch = getchar();
-        // 清除缓冲区中的换行符
-        while (getchar() != '\n' && !feof(stdin));
-        return ch;
+static void* analyzer_thread(void *arg) {
+    packet_queue_t *queue = (packet_queue_t *)arg;
+    modbus_packet_t pkt;
+    while (running) {
+        if (packet_queue_pop(queue, &pkt, 100) == 0) {
+			if (pkt.dst_port != MODBUS_PORT) {
+				 continue;
+			}
+			session_state_t *sess = session_get_or_create(pkt.src_ip, pkt.dst_ip);
+            feature_vector_t feat;
+            session_extract_features(sess, &pkt, &feat);
+			session_update_stats(sess, &pkt);
+            detection_result_t res;
+            detect_anomaly(sess, &pkt, &feat, &res);
+            // 应用配置中的阈值覆盖
+            if (res.confidence >= g_config.anomaly_threshold_high) {
+                res.is_anomaly = 1;
+                res.severity = 3;
+            } else if (res.confidence >= g_config.anomaly_threshold_medium) {
+                res.is_anomaly = 1;
+                res.severity = 2;
+            }
+            execute_response(&res, &pkt);
+            web_update_status(&pkt, &feat, &res);
+        }
     }
-    return 0;
+    return NULL;
 }
 
 int main(int argc, char *argv[]) {
-    init_log();
-    printf("Modbus Anomaly Detector for ICS - A-ST Edition\n");
-    printf("Please run as root and ensure libpcap & iptables are installed.\n");
-
-    init_web();
-    start_http_server();
-
-    printf("Starting packet capture, press 'q' and then Enter to quit...\n\n");
-
-    while (keep_running) {
-        ModbusPacket pkt = {0};
-        Feature feat = {0};
-        AIResult res = {0};
-
-        // 非阻塞抓包（内部使用 select 超时 100ms）
-        capture_packet(&pkt);
-
-        // 检查用户是否输入了 'q'
-        char ch = check_keypress();
-        if (ch == 'q' || ch == 'Q') {
-            printf("\nUser requested exit.\n");
-            keep_running = 0;
-            break;
-        }
-
-        // 空包或超时返回的包（timestamp 和 func_code 均为 0），跳过
-        if (pkt.timestamp == 0 && pkt.func_code == 0) {
-            usleep(10000);
-            continue;
-        }
-
-        parse_modbus(&pkt, &feat);
-        ai_detect(&feat, &res);
-        execute_protect(&res, &pkt);
-        web_update_status(&pkt, &feat, &res);
-
-        if (res.is_anomaly) {
-            printf("[!] ANOMALY: %s -> %s, reason: %s\n", pkt.src_ip, pkt.dst_ip, res.reason);
-        } else {
-            printf("[*] NORMAL: %s, interval=%dms, change=%d\n", pkt.src_ip, feat.interval_ms, feat.value_change);
+    int opt;
+    char *config_file = "/etc/modbus_ids/modbus_ids.conf";
+    char *interface = NULL;
+    int daemon_flag = 0;
+    while ((opt = getopt(argc, argv, "c:i:dh")) != -1) {
+        switch (opt) {
+            case 'c': config_file = optarg; break;
+            case 'i': interface = optarg; break;
+            case 'd': daemon_flag = 1; break;
+            case 'h':
+                printf("Usage: %s [-c config] [-i interface] [-d]\n", argv[0]);
+                return 0;
         }
     }
+    if (load_config(config_file) != 0) {
+        fprintf(stderr, "Config file not found, using defaults\n");
+    }
+    if (interface) strncpy(g_config.interface, interface, sizeof(g_config.interface)-1);
+    if (daemon_flag) g_config.daemonize = 1;
 
-    stop_http_server();
-    close_log();
-    printf("Program terminated.\n");
+    if (g_config.daemonize && daemon(0, 0) < 0) {
+        perror("daemon");
+        return 1;
+    }
+    log_init("modbus-ids", LOG_DAEMON);
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    if (session_manager_init() != 0) {
+        log_write(LOG_ERR, "Session manager init failed");
+        return 1;
+    }
+    packet_queue_t pkt_queue;
+    packet_queue_init(&pkt_queue, 10000);
+
+    capture_args_t cap_args = { .interface = g_config.interface, .queue = &pkt_queue, .promisc = 1, .snaplen = 65536 };
+    pthread_t capture_tid;
+    pthread_create(&capture_tid, NULL, capture_thread, &cap_args);
+
+    #define ANALYZER_THREADS 2
+    pthread_t analyzers[ANALYZER_THREADS];
+    for (int i = 0; i < ANALYZER_THREADS; i++)
+        pthread_create(&analyzers[i], NULL, analyzer_thread, &pkt_queue);
+
+    start_web_server_thread(g_config.web_port);
+    log_write(LOG_INFO, "Modbus IDS started on %s", g_config.interface);
+
+    while (running) sleep(1);
+
+    log_write(LOG_INFO, "Shutting down...");
+    running = 0;
+    pthread_cancel(capture_tid);
+    pthread_join(capture_tid, NULL);
+    for (int i = 0; i < ANALYZER_THREADS; i++)
+        pthread_join(analyzers[i], NULL);
+    packet_queue_destroy(&pkt_queue);
+    session_manager_cleanup();
+    stop_web_server();
+    log_close();
     return 0;
 }

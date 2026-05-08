@@ -1,26 +1,23 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -Iinclude
+CFLAGS = -Wall -Wextra -O2 -pthread -Iinclude
 LDFLAGS = -lpcap -lm
 
-SRCDIR = src
-OBJDIR = obj
-TARGET = modbus_ids
+SRC = src/main.c src/capture.c src/protocol.c src/session_manager.c \
+      src/detector.c src/response.c src/logger.c src/config.c src/web.c
 
-SOURCES = $(wildcard $(SRCDIR)/*.c)
-OBJECTS = $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(SOURCES))
+OBJ = $(SRC:.c=.o)
+TARGET = bin/modbus-ids
 
 all: $(TARGET)
 
-$(TARGET): $(OBJECTS)
-	$(CC) -o $@ $^ $(LDFLAGS)
+$(TARGET): $(OBJ) | bin
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-$(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(OBJDIR):
-	mkdir -p $(OBJDIR)
+bin:
+	mkdir -p bin
 
 clean:
-	rm -rf $(OBJDIR) $(TARGET) web/status.json modbus_ids.log
+	rm -f src/*.o
+	rm -rf bin
 
 .PHONY: all clean
